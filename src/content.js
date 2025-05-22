@@ -7,44 +7,69 @@ function debounce(fn, delay) {
   };
 }
 
-function createTooltip(text) {
-  const tooltip = document.createElement('div');
-  tooltip.innerText = text || 'Loading summary...';
-  tooltip.style.position = 'absolute';
-  tooltip.style.backgroundColor = '#fff8dc';
-  tooltip.style.border = '1px solid #ccc';
-  tooltip.style.padding = '5px 10px';
-  tooltip.style.borderRadius = '5px';
-  tooltip.style.fontSize = '12px';
-  tooltip.style.boxShadow = '0 2px 4px rgba(0,0,0,0.2)';
-  tooltip.style.zIndex = 1000;
-  tooltip.style.maxWidth = '300px';
-  tooltip.style.overflow = 'hidden';
-  tooltip.style.textOverflow = 'ellipsis';
-  return tooltip;
+let globalTooltip = null; // Variable to hold the single tooltip instance
+
+function createOrGetTooltip() {
+  if (globalTooltip && document.body.contains(globalTooltip)) {
+    return globalTooltip;
+  }
+  globalTooltip = document.createElement('div');
+  globalTooltip.className = 'email-summary-tooltip'; // Add a class for styling/identification
+  globalTooltip.style.position = 'absolute';
+  globalTooltip.style.backgroundColor = '#fff8dc'; // Cornsilk
+  globalTooltip.style.border = '1px solid #ccc';
+  globalTooltip.style.padding = '8px 12px'; // Increased padding
+  globalTooltip.style.borderRadius = '6px'; // Slightly more rounded
+  globalTooltip.style.fontSize = '13px'; // Slightly larger font
+  globalTooltip.style.boxShadow = '0 4px 8px rgba(0,0,0,0.15)'; // Softer shadow
+  globalTooltip.style.zIndex = '2147483647'; // Max z-index
+  globalTooltip.style.maxWidth = '350px';
+  globalTooltip.style.overflow = 'hidden';
+  globalTooltip.style.textOverflow = 'ellipsis';
+  globalTooltip.style.display = 'none'; // Initially hidden
+  globalTooltip.style.fontFamily = 'Arial, sans-serif'; // Consistent font
+  document.body.appendChild(globalTooltip);
+  return globalTooltip;
 }
 
 function showSummaryTooltip(event, summaryText) {
-  // Remove any existing tooltips first
-  document.querySelectorAll('.email-summary-tooltip').forEach(el => el.remove());
+  const tooltip = createOrGetTooltip();
+  tooltip.innerText = summaryText || 'Loading summary...';
   
-  const tooltip = createTooltip(summaryText);
-  tooltip.className = 'email-summary-tooltip'; // Add a class for easier removal
-  document.body.appendChild(tooltip);
-  
-  const rect = event.target.getBoundingClientRect();
-  tooltip.style.top = `${rect.bottom + window.scrollY + 5}px`;
-  tooltip.style.left = `${rect.left + window.scrollX}px`;
+  const targetElement = event.target;
+  if (!targetElement) {
+      console.warn("Tooltip target element is invalid.");
+      tooltip.style.display = 'none';
+      return;
+  }
 
-  // Remove tooltip on mouseleave
-  event.target.addEventListener('mouseleave', () => {
-    tooltip.remove();
-  }, { once: true });
+  const rect = targetElement.getBoundingClientRect();
+  tooltip.style.top = `${rect.bottom + window.scrollY + 7}px`; // Adjusted offset
+  tooltip.style.left = `${rect.left + window.scrollX}px`;
+  tooltip.style.display = 'block';
+
+  // Clear previous listeners to avoid multiple removals or actions
+  if (targetElement.tooltipMouseleaveListener) {
+    targetElement.removeEventListener('mouseleave', targetElement.tooltipMouseleaveListener);
+  }
+  if (document.tooltipClickListener) {
+    document.removeEventListener('click', document.tooltipClickListener);
+  }
+
+  targetElement.tooltipMouseleaveListener = () => {
+    if (tooltip) {
+      tooltip.style.display = 'none';
+    }
+  };
   
-  // Also remove on click anywhere
-  document.addEventListener('click', () => {
-    tooltip.remove();
-  }, { once: true });
+  document.tooltipClickListener = (clickEvent) => {
+    if (tooltip && !tooltip.contains(clickEvent.target) && clickEvent.target !== targetElement) {
+      tooltip.style.display = 'none';
+    }
+  };
+
+  targetElement.addEventListener('mouseleave', targetElement.tooltipMouseleaveListener, { passive: true });
+  document.addEventListener('click', document.tooltipClickListener, { passive: true });
 }
 
 // Get auth token from background script
@@ -69,27 +94,40 @@ function getAuthToken() {
 }
 
 // Use the background script to fetch email data
-function fetchEmailFromBackground(messageId, token) {
+function fetchEmailFromBackground(messageId, token, signal) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      return reject(new DOMException('Aborted', 'AbortError'));
+    }
+
+    const listener = (response) => {
+      if (chrome.runtime.lastError) {
+        reject(chrome.runtime.lastError);
+        return;
+      }
+      
+      if (response && response.success) {
+        resolve(response.data);
+      } else {
+        reject(new Error(response?.error || "Failed to fetch email"));
+      }
+    };
+
     chrome.runtime.sendMessage(
       { 
         action: "fetchEmail", 
         messageId: messageId,
         token: token
       }, 
-      (response) => {
-        if (chrome.runtime.lastError) {
-          reject(chrome.runtime.lastError);
-          return;
-        }
-        
-        if (response && response.success) {
-          resolve(response.data);
-        } else {
-          reject(new Error(response?.error || "Failed to fetch email"));
-        }
-      }
+      listener
     );
+
+    signal?.addEventListener('abort', () => {
+      // Attempt to remove listener if possible, though sendMessage doesn't directly support cancellation
+      // This is more of a promise rejection trigger
+      console.log("Aborting fetchEmailFromBackground for messageId:", messageId);
+      reject(new DOMException('Aborted', 'AbortError'));
+    });
   });
 }
 
@@ -452,35 +490,52 @@ function extractContentFromUI(element) {
 }
 
 // Send content to Ollama for summarization
-function summarizeWithOllama(content) {
+function summarizeWithOllama(content, signal) {
   return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(
-      { action: "summarizeWithOllama", content: content }, 
-      (response) => {
-        if (chrome.runtime.lastError) {
-          reject(chrome.runtime.lastError);
-          return;
-        }
-        if (response && response.success) {
-          resolve(response.summary);
-        } else {
-          reject(new Error(response?.error || "Failed to summarize with Ollama"));
-        }
+    if (signal?.aborted) {
+      return reject(new DOMException('Aborted', 'AbortError'));
+    }
+
+    const listener = (response) => {
+      if (chrome.runtime.lastError) {
+        reject(chrome.runtime.lastError);
+        return;
       }
+      if (response && response.success) {
+        resolve(response.summary);
+      } else {
+        reject(new Error(response?.error || "Failed to summarize with Ollama"));
+      }
+    };
+
+    chrome.runtime.sendMessage(
+      { 
+        action: "summarizeWithOllama", 
+        content: content 
+      },
+      listener
     );
+
+    signal?.addEventListener('abort', () => {
+      console.log("Aborting summarizeWithOllama.");
+      reject(new DOMException('Aborted', 'AbortError'));
+    });
   });
 }
 
-// Helper function to fetch and process a specific message ID
-async function fetchSummaryForSpecificId(messageId, element, event) {
+let currentAbortController = null;
+
+async function fetchSummaryForSpecificId(messageId, element, event, signal) {
   console.log("Fetching summary for message ID:", messageId, "for element:", element);
   
   let emailTextContent = extractContentFromUI(element);
   
   if (!emailTextContent && messageId) {
     try {
-      const token = await getAuthToken();
-      const emailData = await fetchEmailFromBackground(messageId, token);
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const token = await getAuthToken(); // Assuming getAuthToken doesn't need signal
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const emailData = await fetchEmailFromBackground(messageId, token, signal);
       
       if (!emailData) {
         console.error("No email data returned from API");
@@ -506,33 +561,49 @@ async function fetchSummaryForSpecificId(messageId, element, event) {
               apiContent = apiContent.substring("Snippet: ".length);
           }
           try {
-              if (/^[A-Za-z0-9+/=]+$/.test(apiContent.replace(/[^A-Za-z0-9+/=]/g, ''))) {
+              // Only attempt atob if it looks like base64
+              if (apiContent.length > 20 && /^[A-Za-z0-9+/=]+$/.test(apiContent.replace(/[^A-Za-z0-9+/=]/g, ''))) {
                   apiContent = atob(apiContent.replace(/-/g, '+').replace(/_/g, '/'));
               }
-          } catch (e) { /* Not base64, or malformed */ }
+          } catch (e) { 
+            console.warn("Failed to decode base64 content, using as is:", e);
+          }
 
           emailTextContent = `From: ${from} | Subject: ${subject} | ${apiContent.trim()}`;
         }
       }
     } catch (apiError) {
+      if (apiError.name === 'AbortError') {
+        console.log('API fetch aborted in fetchSummaryForSpecificId');
+        throw apiError;
+      }
       console.error('Error fetching email via API:', apiError);
     }
   }
 
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
   if (!emailTextContent) {
-    emailTextContent = extractContentFromUI(element);
+    emailTextContent = extractContentFromUI(element); // Try UI extraction again
     if (!emailTextContent) {
         return "Could not extract email content for summarization.";
     }
   }
   
   console.log("Content for Ollama:", emailTextContent);
+  // Check signal before showing tooltip and before calling Ollama
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   showSummaryTooltip(event, "Summarizing with Ollama..."); 
 
   try {
-    const ollamaSummary = await summarizeWithOllama(emailTextContent);
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const ollamaSummary = await summarizeWithOllama(emailTextContent, signal);
     return `Ollama: ${ollamaSummary}`;
   } catch (ollamaError) {
+    if (ollamaError.name === 'AbortError') {
+        console.log('Ollama summarization aborted.');
+        throw ollamaError;
+    }
     console.error("Ollama summarization failed:", ollamaError);
     const simpleSummary = emailTextContent.split('|').pop().trim().slice(0, 150);
     return simpleSummary + (simpleSummary.length >= 150 ? '...' : ''); 
@@ -540,7 +611,15 @@ async function fetchSummaryForSpecificId(messageId, element, event) {
 }
 
 async function fetchSummaryForEmail(element, event) {
+  if (currentAbortController) {
+    currentAbortController.abort(); // Abort any ongoing fetch/summary
+  }
+  currentAbortController = new AbortController();
+  const signal = currentAbortController.signal;
+
   try {
+    showSummaryTooltip(event, 'Loading summary...'); // Show initial loading message
+    
     let contentForSummary = extractContentFromUI(element);
     let messageId = null;
 
@@ -550,22 +629,47 @@ async function fetchSummaryForEmail(element, event) {
         return 'Unable to identify this email or extract its content.';
     }
 
-    if (messageId && messageId.length < 10) {
+    if (messageId && messageId.length < 10) { // Basic sanity check for ID length
         console.log("Short/invalid message ID, trying to find a better one:", messageId);
         const betterMessageId = findBetterMessageId(element);
         if (betterMessageId) {
             messageId = betterMessageId;
             console.log("Using better message ID:", messageId);
-        } else if (!contentForSummary) {
+        } else if (!contentForSummary) { // If still no ID and no UI content
             return "Cannot identify email. Try opening it.";
         }
     }
     
-    return await fetchSummaryForSpecificId(messageId, element, event);
+    if (signal.aborted) {
+        console.log("Fetch summary aborted before starting specific ID fetch.");
+        return "Summarization cancelled.";
+    }
+    
+    const summary = await fetchSummaryForSpecificId(messageId, element, event, signal);
+    if (signal.aborted) {
+        console.log("Fetch summary aborted after specific ID fetch.");
+        // Tooltip might have been updated by fetchSummaryForSpecificId, hide or set to cancelled.
+        const tooltip = createOrGetTooltip();
+        if (tooltip.style.display === 'block') { // Only if still visible for this event chain
+            tooltip.innerText = "Summarization cancelled.";
+        }
+        return "Summarization cancelled.";
+    }
+    return summary;
 
   } catch (err) {
+    if (err.name === 'AbortError') {
+      console.log('fetchSummaryForEmail aborted.');
+      return "Summarization cancelled.";
+    }
     console.error('Error in fetchSummaryForEmail:', err);
     return `Error: ${err.message}`;
+  } finally {
+    // If this controller is still the active one, nullify it.
+    // This prevents aborting a new request if this one finished successfully.
+    if (currentAbortController && currentAbortController.signal === signal) {
+        currentAbortController = null;
+    }
   }
 }
 
@@ -589,48 +693,78 @@ function initHoverSummary() {
   
   const combinedSelector = selectors.join(', ');
   
-  const observer = new MutationObserver(() => {
-    document.querySelectorAll(combinedSelector).forEach(subject => {
+  const debouncedFetchAndShowSummary = debounce(async (event) => {
+    const subjectElement = event.target.closest(combinedSelector);
+    if (!subjectElement) return;
+
+    try {
+      // The initial "Loading summary..." is now set inside fetchSummaryForEmail
+      // to ensure it happens before any async operations that could be aborted.
+      const summary = await fetchSummaryForEmail(subjectElement, event);
+      // Check if the controller was aborted during the process.
+      // If currentAbortController is null here, it means fetchSummaryForEmail completed without being aborted by a new event.
+      // If it's not null, it means a new event came in and this execution path should not update the tooltip.
+      if (currentAbortController && currentAbortController.signal.aborted && event.target.tooltipMouseleaveListener) {
+          // If an abort happened and this is an old, aborted call, don't update.
+          // The tooltip might be managed by a newer call or hidden by mouseleave.
+          console.log("Debounced call: summarization was aborted, not updating tooltip.");
+          return;
+      }
+      showSummaryTooltip(event, summary); 
+    } catch (error) {
+      // AbortErrors should be caught and handled within fetchSummaryForEmail or fetchSummaryForSpecificId
+      // If an error bubbles up here, it's likely not an AbortError.
+      console.error("Error in debounced hover handler:", error);
+      showSummaryTooltip(event, `Error: ${error.message}`); 
+    }
+  }, 300);
+
+  const setupListeners = (targetNode) => {
+    targetNode.querySelectorAll(combinedSelector).forEach(subject => {
       if (!subject.dataset.summaryAttached) {
         subject.dataset.summaryAttached = 'true';
-        
-        subject.addEventListener('mouseenter', debounce(async (event) => {
-          try {
-            showSummaryTooltip(event, 'Loading summary...'); 
-            const summary = await fetchSummaryForEmail(subject, event);
-            showSummaryTooltip(event, summary); 
-          } catch (error) {
-            console.error("Error showing summary:", error);
-            showSummaryTooltip(event, `Error: ${error.message}`); 
-          }
-        }, 300));
+        subject.addEventListener('mouseenter', debouncedFetchAndShowSummary);
+        // Mouseleave is handled by showSummaryTooltip
       }
     });
+  };
+  
+  const observer = new MutationObserver((mutationsList) => {
+    for (const mutation of mutationsList) {
+      if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+        mutation.addedNodes.forEach(node => {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            if (node.matches && node.matches(combinedSelector)) {
+              if (!node.dataset.summaryAttached) {
+                node.dataset.summaryAttached = 'true';
+                node.addEventListener('mouseenter', debouncedFetchAndShowSummary);
+              }
+            }
+            setupListeners(node); // Also check children of added nodes
+          }
+        });
+      } else if (mutation.type === 'attributes') {
+        // If an attribute relevant to ID finding changes, re-evaluate elements
+        // This is less critical for hover listeners but good for completeness
+        if (targetNode.matches && targetNode.matches(combinedSelector)) {
+             if (!targetNode.dataset.summaryAttached) { // Element might have been dynamically loaded
+                targetNode.dataset.summaryAttached = 'true';
+                targetNode.addEventListener('mouseenter', debouncedFetchAndShowSummary);
+            }
+        }
+      }
+    }
   });
 
   observer.observe(document.body, { 
     childList: true, 
     subtree: true,
-    attributes: true,
-    attributeFilter: ['id', 'data-legacy-message-id', 'data-message-id', 'data-thread-id']
+    attributes: true, // Observe attributes like data-message-id if they change
+    attributeFilter: ['id', 'data-legacy-message-id', 'data-message-id', 'data-thread-id', 'class', 'role'] // Added class/role
   });
   
-  document.querySelectorAll(combinedSelector).forEach(subject => {
-    if (!subject.dataset.summaryAttached) {
-      subject.dataset.summaryAttached = 'true';
-      
-      subject.addEventListener('mouseenter', debounce(async (event) => {
-        try {
-          showSummaryTooltip(event, 'Loading summary...'); 
-          const summary = await fetchSummaryForEmail(subject, event);
-          showSummaryTooltip(event, summary); 
-        } catch (error) {
-          console.error("Error showing summary:", error);
-          showSummaryTooltip(event, `Error: ${error.message}`); 
-        }
-      }, 300));
-    }
-  });
+  // Initial setup for elements already present
+  setupListeners(document.body);
 }
 
 // Wait for DOM content to be loaded
