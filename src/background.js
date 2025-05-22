@@ -56,11 +56,9 @@ function cleanMessageId(id) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   console.log("Background received message:", message);
   
-  // For backward compatibility, handle both action and type properties
   const messageType = message.action || message.type;
   
   if (messageType === "getAuthToken") {
-    // Make sure identity API is available
     if (typeof chrome.identity === 'undefined') {
       console.error("Chrome identity API is not available");
       sendResponse({ success: false, error: "Identity API not available" });
@@ -93,19 +91,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         token: token 
       });
     });
-    
-    // Return true to indicate we'll respond asynchronously
     return true;
   }
   
-  // Handle fetch request from content script
   if (messageType === "fetchEmail") {
     if (!message.token || !message.messageId) {
       sendResponse({ success: false, error: "Missing token or messageId" });
       return true;
     }
     
-    // The simplest approach - just get a list of recent messages
     console.log("Fetching recent messages list");
     const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=10`;
     
@@ -127,11 +121,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       
       console.log("Found recent messages:", listData.messages.length);
       
-      // Find a message with a valid ID
       const validId = listData.messages[0].id;
       console.log("Using message ID:", validId);
       
-      // Now fetch this specific message
       return fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${validId}`, {
         headers: {
           'Authorization': `Bearer ${message.token}`
@@ -152,8 +144,74 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       console.error("Failed to fetch message:", error);
       sendResponse({ success: false, error: error.message });
     });
+    return true;
+  }
+
+  if (messageType === "summarizeWithOllama") {
+    if (!message.content) {
+      sendResponse({ success: false, error: "No content provided for summarization" });
+      return true;
+    }
+
+    let emailContent = message.content;
+    emailContent = emailContent.replace(/\s\s+/g, ' ').trim();
+    const maxLength = 2000;
+    if (emailContent.length > maxLength) {
+      emailContent = emailContent.substring(0, maxLength) + "...";
+    }
+
+    const ollamaUrl = "http://localhost:11434/api/generate";
+    const ollamaPayload = {
+      model: "tinyllama", 
+      prompt: `Summarize this email in one sentence: ###${emailContent}###`,
+      stream: false,
+      options: {
+        num_ctx: 2048
+      }
+    };
+
+    console.log("Sending to Ollama (tinyllama). Prompt length:", ollamaPayload.prompt.length);
     
-    // Return true to indicate we'll respond asynchronously
+    (async () => {
+      let responseSent = false;
+      try {
+        const response = await fetch(ollamaUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(ollamaPayload)
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error("Ollama API Error Response Text:", errorText);
+          throw new Error(`Ollama API error: ${response.status} - ${errorText.substring(0,100)}`);
+        }
+
+        const ollamaData = await response.json();
+        console.log("Ollama response:", ollamaData);
+
+        if (ollamaData.response) {
+          if (!responseSent) {
+            sendResponse({ success: true, summary: ollamaData.response.trim() });
+            responseSent = true;
+          }
+        } else {
+          if (!responseSent) {
+            sendResponse({ success: false, error: "Ollama did not return a summary. Response: " + JSON.stringify(ollamaData) });
+            responseSent = true;
+          }
+        }
+      } catch (error) {
+        console.error("Error contacting Ollama or processing response:", error);
+        if (!responseSent) {
+          sendResponse({ success: false, error: error.message });
+          responseSent = true;
+        }
+      }
+    })();
+
     return true;
   }
 });

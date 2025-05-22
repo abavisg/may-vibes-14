@@ -407,7 +407,6 @@ function extractEmailContent(emailData) {
 // Helper function to extract content directly from Gmail's UI
 function extractContentFromUI(element) {
   try {
-    // Try to find the closest row or email container
     const row = element.closest('tr.zA') || 
                 element.closest('[role="row"]') || 
                 element.closest('.zA');
@@ -417,14 +416,12 @@ function extractContentFromUI(element) {
       return null;
     }
     
-    // Extract sender info
     let sender = '';
     const senderElements = row.querySelectorAll('.yW span, .zF, [email]');
     if (senderElements.length > 0) {
       sender = senderElements[0].textContent || senderElements[0].getAttribute('email') || '';
     }
     
-    // Extract subject
     let subject = '';
     const subjectElement = element.closest('.bog') || 
                           row.querySelector('.y6 span:not(.T6), .bog, .bqe');
@@ -432,18 +429,16 @@ function extractContentFromUI(element) {
       subject = subjectElement.textContent || '';
     }
     
-    // Extract snippet
     let snippet = '';
     const snippetElement = row.querySelector('.y2, .xY .xW span');
     if (snippetElement) {
       snippet = snippetElement.textContent || '';
     }
     
-    // Combine info into a meaningful summary
     const info = [];
-    if (sender) info.push(`From: ${sender}`);
-    if (subject) info.push(`Subject: ${subject}`);
-    if (snippet) info.push(snippet);
+    if (sender) info.push(`From: ${sender.trim()}`);
+    if (subject) info.push(`Subject: ${subject.trim()}`);
+    if (snippet) info.push(snippet.trim());
     
     if (info.length > 0) {
       return info.join(' | ');
@@ -456,149 +451,120 @@ function extractContentFromUI(element) {
   }
 }
 
+// Send content to Ollama for summarization
+function summarizeWithOllama(content) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { action: "summarizeWithOllama", content: content }, 
+      (response) => {
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+          return;
+        }
+        if (response && response.success) {
+          resolve(response.summary);
+        } else {
+          reject(new Error(response?.error || "Failed to summarize with Ollama"));
+        }
+      }
+    );
+  });
+}
+
 // Helper function to fetch and process a specific message ID
-async function fetchSummaryForSpecificId(messageId, element) {
-  console.log("Fetching summary for message ID:", messageId);
+async function fetchSummaryForSpecificId(messageId, element, event) {
+  console.log("Fetching summary for message ID:", messageId, "for element:", element);
   
-  // First try to extract content directly from UI as a reliable fallback
-  const uiContent = extractContentFromUI(element);
-  if (uiContent) {
-    console.log("Successfully extracted content from UI");
-    return uiContent;
+  let emailTextContent = extractContentFromUI(element);
+  
+  if (!emailTextContent && messageId) {
+    try {
+      const token = await getAuthToken();
+      const emailData = await fetchEmailFromBackground(messageId, token);
+      
+      if (!emailData) {
+        console.error("No email data returned from API");
+      } else {
+        console.log("Received email data from API:", emailData);
+        
+        let subject = '';
+        let from = '';
+        
+        if (emailData.payload && emailData.payload.headers) {
+          for (const header of emailData.payload.headers) {
+            if (header.name.toLowerCase() === 'subject') {
+              subject = header.value;
+            } else if (header.name.toLowerCase() === 'from') {
+              from = header.value;
+            }
+          }
+        }
+        
+        let apiContent = emailData.snippet || extractEmailContent(emailData);
+        if (apiContent) {
+           if (apiContent.startsWith("Snippet: ")) {
+              apiContent = apiContent.substring("Snippet: ".length);
+          }
+          try {
+              if (/^[A-Za-z0-9+/=]+$/.test(apiContent.replace(/[^A-Za-z0-9+/=]/g, ''))) {
+                  apiContent = atob(apiContent.replace(/-/g, '+').replace(/_/g, '/'));
+              }
+          } catch (e) { /* Not base64, or malformed */ }
+
+          emailTextContent = `From: ${from} | Subject: ${subject} | ${apiContent.trim()}`;
+        }
+      }
+    } catch (apiError) {
+      console.error('Error fetching email via API:', apiError);
+    }
+  }
+
+  if (!emailTextContent) {
+    emailTextContent = extractContentFromUI(element);
+    if (!emailTextContent) {
+        return "Could not extract email content for summarization.";
+    }
   }
   
+  console.log("Content for Ollama:", emailTextContent);
+  showSummaryTooltip(event, "Summarizing with Ollama..."); 
+
   try {
-    // Get auth token
-    const token = await getAuthToken();
-    
-    // Fetch email using background script
-    const emailData = await fetchEmailFromBackground(messageId, token);
-    
-    // Check if we got a valid response
-    if (!emailData) {
-      console.error("No email data returned");
-      return "Error: No email data returned from the API.";
-    }
-    
-    console.log("Received email data:", emailData);
-    
-    // Extract metadata for a better summary
-    let subject = '';
-    let from = '';
-    
-    // Try to get headers if available
-    if (emailData.payload && emailData.payload.headers) {
-      for (const header of emailData.payload.headers) {
-        if (header.name.toLowerCase() === 'subject') {
-          subject = header.value;
-        } else if (header.name.toLowerCase() === 'from') {
-          from = header.value;
-        }
-      }
-    }
-    
-    // Use snippet if available (most reliable part of Gmail API)
-    if (emailData.snippet) {
-      const parts = [];
-      if (from) parts.push(`From: ${from}`);
-      if (subject) parts.push(`Subject: ${subject}`);
-      parts.push(emailData.snippet);
-      
-      return parts.join(' | ');
-    }
-    
-    // Extract the email body content as fallback
-    const bodyContent = extractEmailContent(emailData);
-    
-    if (!bodyContent) {
-      console.error("Could not extract email content");
-      return "Could not extract email content.";
-    }
-    
-    // Process the content - might be base64 or plain text
-    try {
-      let decodedText;
-      
-      // If it looks like base64, try to decode it
-      if (/^[A-Za-z0-9+/=]+$/.test(bodyContent.replace(/[^A-Za-z0-9+/=]/g, ''))) {
-        try {
-          decodedText = atob(bodyContent.replace(/-/g, '+').replace(/_/g, '/'));
-        } catch (decodeError) {
-          // If decoding fails, use the content as is
-          decodedText = bodyContent;
-        }
-      } else {
-        // Not base64, use as is
-        decodedText = bodyContent;
-      }
-      
-      // Create a one-line summary
-      const summary = decodedText.replace(/\s+/g, ' ').trim().slice(0, 150);
-      return summary + (summary.length >= 150 ? '...' : '');
-    } catch (processError) {
-      console.error("Error processing email content:", processError);
-      
-      // If all processing fails, just return the content as is, truncated
-      return bodyContent.slice(0, 150) + (bodyContent.length > 150 ? '...' : '');
-    }
-  } catch (err) {
-    console.error('Error fetching email:', err);
-    
-    // If we have UI content as a fallback, use it
-    if (uiContent) {
-      return uiContent;
-    }
-    
-    // Otherwise return error
-    return `Error: ${err.message}`;
+    const ollamaSummary = await summarizeWithOllama(emailTextContent);
+    return `Ollama: ${ollamaSummary}`;
+  } catch (ollamaError) {
+    console.error("Ollama summarization failed:", ollamaError);
+    const simpleSummary = emailTextContent.split('|').pop().trim().slice(0, 150);
+    return simpleSummary + (simpleSummary.length >= 150 ? '...' : ''); 
   }
 }
 
-async function fetchSummaryForEmail(element) {
+async function fetchSummaryForEmail(element, event) {
   try {
-    // First try to extract directly from the UI, which is most reliable
-    const uiContent = extractContentFromUI(element);
-    if (uiContent) {
-      console.log("Using content extracted directly from UI");
-      return uiContent;
+    let contentForSummary = extractContentFromUI(element);
+    let messageId = null;
+
+    messageId = extractMessageId(element);
+    
+    if (!messageId && !contentForSummary) {
+        return 'Unable to identify this email or extract its content.';
+    }
+
+    if (messageId && messageId.length < 10) {
+        console.log("Short/invalid message ID, trying to find a better one:", messageId);
+        const betterMessageId = findBetterMessageId(element);
+        if (betterMessageId) {
+            messageId = betterMessageId;
+            console.log("Using better message ID:", messageId);
+        } else if (!contentForSummary) {
+            return "Cannot identify email. Try opening it.";
+        }
     }
     
-    // If that fails, try API approach
-    const messageId = extractMessageId(element);
-    
-    if (!messageId) {
-      return 'Unable to identify this email. Hover over the subject line of an opened email.';
-    }
-    
-    // Message ID validation
-    if (messageId.length < 10) {
-      console.log("Message ID seems invalid (length):", messageId);
-      
-      // For this specific case, try to find a better ID
-      const betterMessageId = findBetterMessageId(element);
-      if (betterMessageId) {
-        console.log("Found better message ID:", betterMessageId);
-        return await fetchSummaryForSpecificId(betterMessageId, element);
-      }
-      
-      // Fallback to extracting directly from UI
-      return uiContent || "Cannot identify this email properly. Try opening the email first.";
-    }
-    
-    return await fetchSummaryForSpecificId(messageId, element);
-    
+    return await fetchSummaryForSpecificId(messageId, element, event);
+
   } catch (err) {
-    console.error('Error fetching email:', err);
-    
-    // Provide more helpful error messages
-    if (err.message.includes('404')) {
-      return 'Error: Email not found. Try opening the email first.';
-    }
-    
-    if (err.message.includes('401') || err.message.includes('403')) {
-      return 'Error: Not authorized to access this email. Try re-authenticating.';
-    }
-    
+    console.error('Error in fetchSummaryForEmail:', err);
     return `Error: ${err.message}`;
   }
 }
@@ -606,56 +572,42 @@ async function fetchSummaryForEmail(element) {
 function initHoverSummary() {
   console.log("Initializing email summary hover functionality");
   
-  // Multiple selectors to try to find Gmail subject lines
   const selectors = [
-    'tr.zA span.bog',                  // Classic Gmail view
-    'tr.zA .y6 span:not(.T6)',         // Alternate Gmail format
-    '.zA[role="row"] h2 span',         // New Gmail format
-    '.zA[role="row"] .y6',             // Another variation
-    '.ha h2.J-JN-I',                   // Conversation view
-    'td[role="gridcell"] .bog',        // Another variation
-    '.Zt',                             // Yet another Gmail format
-    '.zA.yO .bog',                     // Read emails
-    'h2.bqe',                          // Another subject line format
-    '.xY.a4W h2',                      // Different UI variation
-    'tr:not(.btb) span.bog',           // Non-grouped emails
-    'tr.zA [role="link"]'              // Clickable areas in rows
+    'tr.zA span.bog',                  
+    'tr.zA .y6 span:not(.T6)',         
+    '.zA[role="row"] h2 span',         
+    '.zA[role="row"] .y6',             
+    '.ha h2.J-JN-I',                   
+    'td[role="gridcell"] .bog',        
+    '.Zt',                             
+    '.zA.yO .bog',                     
+    'h2.bqe',                          
+    '.xY.a4W h2',                      
+    'tr:not(.btb) span.bog',           
+    'tr.zA [role="link"]'              
   ];
   
   const combinedSelector = selectors.join(', ');
   
-  // Log all found elements for debugging
-  const allElements = document.querySelectorAll('tr.zA, div.zA, [role="row"], .Zt, .bqe');
-  console.log(`Debug: Found ${allElements.length} potential container elements`);
-  
   const observer = new MutationObserver(() => {
-    const subjectLines = document.querySelectorAll(combinedSelector);
-    
-    if (subjectLines.length > 0) {
-      console.log(`Found ${subjectLines.length} potential subject lines`);
-    }
-    
-    subjectLines.forEach(subject => {
+    document.querySelectorAll(combinedSelector).forEach(subject => {
       if (!subject.dataset.summaryAttached) {
         subject.dataset.summaryAttached = 'true';
         
         subject.addEventListener('mouseenter', debounce(async (event) => {
           try {
-            // Show loading tooltip immediately
-            showSummaryTooltip(event, 'Loading summary...');
-            
-            const summary = await fetchSummaryForEmail(subject);
-            showSummaryTooltip(event, summary);
+            showSummaryTooltip(event, 'Loading summary...'); 
+            const summary = await fetchSummaryForEmail(subject, event);
+            showSummaryTooltip(event, summary); 
           } catch (error) {
             console.error("Error showing summary:", error);
-            showSummaryTooltip(event, `Error: ${error.message}`);
+            showSummaryTooltip(event, `Error: ${error.message}`); 
           }
         }, 300));
       }
     });
   });
 
-  // Observe changes to catch dynamically loaded emails
   observer.observe(document.body, { 
     childList: true, 
     subtree: true,
@@ -663,24 +615,18 @@ function initHoverSummary() {
     attributeFilter: ['id', 'data-legacy-message-id', 'data-message-id', 'data-thread-id']
   });
   
-  // Initial scan for existing emails
-  const subjectLines = document.querySelectorAll(combinedSelector);
-  console.log(`Initial scan: Found ${subjectLines.length} subject lines`);
-  
-  subjectLines.forEach(subject => {
+  document.querySelectorAll(combinedSelector).forEach(subject => {
     if (!subject.dataset.summaryAttached) {
       subject.dataset.summaryAttached = 'true';
       
       subject.addEventListener('mouseenter', debounce(async (event) => {
         try {
-          // Show loading tooltip immediately
-          showSummaryTooltip(event, 'Loading summary...');
-          
-          const summary = await fetchSummaryForEmail(subject);
-          showSummaryTooltip(event, summary);
+          showSummaryTooltip(event, 'Loading summary...'); 
+          const summary = await fetchSummaryForEmail(subject, event);
+          showSummaryTooltip(event, summary); 
         } catch (error) {
           console.error("Error showing summary:", error);
-          showSummaryTooltip(event, `Error: ${error.message}`);
+          showSummaryTooltip(event, `Error: ${error.message}`); 
         }
       }, 300));
     }
