@@ -1,0 +1,7 @@
+PLACEHOLDER REMINDER:
+
+The extension requires an icon.png file in this directory.
+Create a 128x128 pixel PNG image for the extension icon.
+
+This file is just a reminder and is not used by the extension.
+Please replace the existing icon.png file or create a new one if it doesn't exist. 
